@@ -117,6 +117,12 @@ void _mlir_ciface_forward_decode169(MemRef<float, 3> *, MemRef<float, 1> *,
 
 using HighResClock = std::chrono::high_resolution_clock;
 
+/// [ACC] 插桩: 返回两时间点间隔(ms)
+inline double msBetween(const HighResClock::time_point &a,
+                       const HighResClock::time_point &b) {
+  return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
 struct MaxLocPair {
   float value = -std::numeric_limits<float>::infinity();
   int index = -1;
@@ -513,6 +519,13 @@ int main(int argc, char *argv[]) {
 
     double decodeTimeAccumMs = 0.0;
     size_t decodeTokens = 0;
+    // [ACC] 分项累计(ms)
+    double accD0 = 0, accAttn = 0, accMLP = 0, accComm = 0, accNorm = 0,
+           accLM = 0, accAR = 0;
+    // ACC_QUIET 环境变量: 抑制 [ACC]/[ACC-M] 账本打印(验证输出转发开销)
+    bool accQuiet = getenv("ACC_QUIET") != nullptr;
+    // [ACC] 每层分项累计(ms)
+    double accAttnM[28] = {}, accMlpM[28] = {};
 
     MPI_Request send_req_decode[5];
     int ctrl = 0;
@@ -524,9 +537,12 @@ int main(int argc, char *argv[]) {
 
       const auto decodeStart = HighResClock::now();
 
+      auto acc_t0 = HighResClock::now();
       _mlir_ciface_forward_decode0(resultContainerDecodePtr, &paramsContainer0,
                                    &inputContainerDecode, &cachePosition);
       inputPtr = resultContainerDecodePtr->data.getData();
+      auto acc_t1 = HighResClock::now();
+      accD0 += msBetween(acc_t0, acc_t1);
 
       MPI_Isend(inputPtr, HiddenSize0, MPI_FLOAT, PeerRank, 0, MPI_COMM_WORLD,
                 &send_req_decode[0]);
@@ -543,9 +559,11 @@ int main(int argc, char *argv[]) {
                   sizeof(float) * HiddenSize0);
 
       for (int m = 0; m < times; m++) {
+        auto at0 = HighResClock::now();
         _mlir_ciface_forward_decode1(&sub3DContainerDecode,
                                      &paramsContainersRMS[m],
                                      &subResultContainerDecode);
+        auto at1 = HighResClock::now();
 
         _mlir_ciface_forward_decode2(
             kvDecodeContainerPtr0, &paramsContainersMHA[m], &cachePosition,
@@ -556,6 +574,7 @@ int main(int argc, char *argv[]) {
         kv0[2 * m + 1] = kvDecodeContainerPtr0->vcache;
         tmp2DContainerDecode = kvDecodeContainerPtr0->data;
         mhaOutputPtrDecode = tmp2DContainerDecode.getData();
+        auto at2 = HighResClock::now();
 
         if (comm_sub != MPI_COMM_NULL) {
           reduceSumTwoRanksSendrecv(mhaOutputPtrDecode,
@@ -565,6 +584,7 @@ int main(int argc, char *argv[]) {
           std::memcpy(sub2DContainerDecode.getData(), mhaOutputPtrDecode,
                       sizeof(float) * HiddenSize0);
         }
+        auto at3 = HighResClock::now();
 
         _mlir_ciface_forward_decode3(&subResultContainerDecode,
                                      &subResultContainerDecode,
@@ -573,11 +593,13 @@ int main(int argc, char *argv[]) {
         _mlir_ciface_forward_decode1(&sub3DContainerDecode,
                                      &paramsContainersRMS0[m],
                                      &subResultContainerDecode);
+        auto at4 = HighResClock::now();
 
         _mlir_ciface_forward_decode5(&tmp2DContainerDecode,
                                      &paramsContainersMLP[m],
                                      &sub3DContainerDecode);
         mhaOutputPtrDecode = tmp2DContainerDecode.getData();
+        auto at5 = HighResClock::now();
 
         if (comm_sub != MPI_COMM_NULL) {
           reduceSumTwoRanksSendrecv(mhaOutputPtrDecode,
@@ -587,10 +609,20 @@ int main(int argc, char *argv[]) {
           std::memcpy(sub2DContainerDecode.getData(), mhaOutputPtrDecode,
                       sizeof(float) * HiddenSize0);
         }
+        auto at6 = HighResClock::now();
 
         _mlir_ciface_forward_decode3(&subResultContainerDecode,
                                      &subResultContainerDecode,
                                      &sub2DContainerDecode);
+        auto at7 = HighResClock::now();
+
+        accNorm += msBetween(at0, at1) + msBetween(at3, at4) +
+                   msBetween(at6, at7);
+        accAttn += msBetween(at1, at2);
+        accComm += msBetween(at2, at3) + msBetween(at5, at6);
+        accMLP += msBetween(at4, at5);
+        accAttnM[m] += msBetween(at1, at2);
+        accMlpM[m] += msBetween(at4, at5);
       }
 
       MPI_Waitall(5, send_req_decode, MPI_STATUSES_IGNORE);
@@ -599,8 +631,10 @@ int main(int argc, char *argv[]) {
                   subResultContainerDecode.getData(),
                   sizeof(float) * HiddenSize0);
 
+      auto alt0 = HighResClock::now();
       _mlir_ciface_forward_decode169(&resultDecodeShard0, &paramsContainer2,
                                      &myMemRef_decode1);
+      auto alt1 = HighResClock::now();
 
       const float *decodeShard0StartPtr = resultDecodeShard0.getData();
       const float *decodeShard0EndPtr = decodeShard0StartPtr + VocabShardSize;
@@ -610,6 +644,9 @@ int main(int argc, char *argv[]) {
 
       MaxLocPair globalTop1 =
           reduceMaxLoc(localDecodeMaxValue, localDecodeMaxIndex, comm_sub);
+      auto alt2 = HighResClock::now();
+      accLM += msBetween(alt0, alt1);
+      accAR += msBetween(alt1, alt2);
       maxIndex = globalTop1.index;
 
       const auto decodeEnd = HighResClock::now();
@@ -620,6 +657,18 @@ int main(int argc, char *argv[]) {
 
       tok = inputContainerPrefill.getStr(maxIndex);
       printIterInfo(i, tok, decodeTime.count() / 1000.0);
+
+      if (!accQuiet) {
+        std::cout << "[ACC] d0=" << accD0 << "ms attn=" << accAttn
+                  << "ms mlp=" << accMLP << "ms comm=" << accComm
+                  << "ms norm=" << accNorm << "ms lm=" << accLM
+                  << "ms ar=" << accAR << "ms" << std::endl;
+        std::cout << "[ACC-M] layer attn mlp" << std::endl;
+        for (int m = 0; m < times; m++) {
+          std::cout << "[ACC-M] " << m << " attn=" << accAttnM[m]
+                    << "ms mlp=" << accMlpM[m] << "ms" << std::endl;
+        }
+      }
 
       if (maxIndex == 151643) {
         ctrl = 1;

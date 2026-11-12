@@ -13851,9 +13851,9 @@ def gqa_attention_fused_op(node: GQAAttentionFusedOp, symbol_table):
     need_cast = mlir_dtype != compute_dtype
 
     # I/O vector type (matches tensor element type for TransferRead/Write)
-    v16_io = ir.VectorType.get([16], mlir_dtype)
+    v16_io = ir.VectorType.get([32], mlir_dtype)
     # Compute vector type (f32 for numerical stability)
-    v16_compute = ir.VectorType.get([16], compute_dtype)
+    v16_compute = ir.VectorType.get([32], compute_dtype)
 
     # ========= shape =========
     query_shape = query.type.shape
@@ -13883,8 +13883,24 @@ def gqa_attention_fused_op(node: GQAAttentionFusedOp, symbol_table):
     q_dim2 = arith.ConstantOp(index, query_shape[2], loc=loc).result
     q_dim3 = arith.ConstantOp(index, query_shape[3], loc=loc).result
     k_dim2 = arith.ConstantOp(index, key_shape[2], loc=loc).result
-    vec_len = arith.ConstantOp(index, 16, loc=loc).result
+    vec_len = arith.ConstantOp(index, 32, loc=loc).result
     group_size = query_shape[1] // key_shape[1]
+
+    # ========= dynamic seq bound (sparse causal attention) =========
+    # The KV cache position index node is attached by gqa_attention_fusion.
+    # The causal mask is mask[i] = (i <= position) (tosa.greater_equal in
+    # subgraph0_decode0), so QK^T/softmax/score@V only need to process
+    # rows [0, position] instead of the full cache length.
+    pos_node_name = node.kwargs.get("position", None)
+    seq_bound = None
+    if pos_node_name is not None:
+        pos_tensor = symbol_table.get((str(pos_node_name), 0), pos_node_name)
+        if pos_tensor is not None:
+            pos_scalar = tensor.ExtractOp(pos_tensor, [c0], loc=loc).result
+            pos_index = arith.IndexCastOp(index, pos_scalar, loc=loc).result
+            one_idx = arith.ConstantOp(index, 1, loc=loc).result
+            seq_bound = arith.AddIOp(pos_index, one_idx, loc=loc).result
+    qk_bound = seq_bound if seq_bound is not None else k_dim2
 
     # ========= mask preprocess =========
     if attn_mask is not None:
@@ -13896,135 +13912,266 @@ def gqa_attention_fused_op(node: GQAAttentionFusedOp, symbol_table):
             )
             attn_mask = tosa.CastOp(mask_cast_type, attn_mask).result
 
-    # ========= QK^T =========
-    # Score tensor uses compute_dtype (f32) for numerical stability
-    score_init_tensor_type = ir.RankedTensorType.get(
+    # ========= QK^T (parallel over b,h,q,k) =========
+    score_mem_type = ir.MemRefType.get(
         [query_shape[0], query_shape[1], query_shape[2], key_shape[2]],
         compute_dtype,
     )
-    element = ir.FloatAttr.get(compute_dtype, 0.0)
-    attr = ir.DenseElementsAttr.get_splat(score_init_tensor_type, element)
-    score_init = arith.ConstantOp(score_init_tensor_type, attr).result
+    score_mem = memref.AllocOp(score_mem_type, [], [], loc=loc)
 
-    score = scf.ForOp(c0, batch_dim, c1, iter_args=[score_init])
-    with ir.InsertionPoint(score.body):
-        b = score.induction_variable
-        acc_b = score.inner_iter_args[0]
+    par_qk = scf.ParallelOp(
+        results_=[],
+        lowerBound=[c0, c0, c0, c0],
+        upperBound=[batch_dim, q_dim1, q_dim2, qk_bound],
+        step=[c1, c1, c1, c1],
+        initVals=[],
+        loc=loc,
+    )
+    par_qk_block = par_qk.regions[0].blocks.append()
+    with ir.InsertionPoint(par_qk_block):
+        iv_b = par_qk_block.add_argument(index, loc)
+        iv_h = par_qk_block.add_argument(index, loc)
+        iv_q = par_qk_block.add_argument(index, loc)
+        iv_k = par_qk_block.add_argument(index, loc)
+        group_size_i = arith.ConstantOp(index, group_size, loc=loc).result
+        h_kv = arith.DivSIOp(iv_h, group_size_i, loc=loc).result
 
-        loop_h = scf.ForOp(c0, q_dim1, c1, iter_args=[acc_b])
-        with ir.InsertionPoint(loop_h.body):
-            h = loop_h.induction_variable
-            acc_hv = loop_h.inner_iter_args[0]
-            group_size_i = arith.ConstantOp(index, group_size, loc=loc).result
-            h_kv = arith.DivSIOp(h, group_size_i, loc=loc).result
+        vec_loop = scf.ForOp(c0, q_dim3, vec_len, iter_args=[zero_vec])
+        with ir.InsertionPoint(vec_loop.body):
+            d = vec_loop.induction_variable
+            va = vec_loop.inner_iter_args[0]
+            perm_map = ir.AffineMap.get(4, 0, [ir.AffineDimExpr.get(3)])
+            # Read Q, K in tensor element type (f16 or f32)
+            qv_raw = vector.TransferReadOp(
+                v16_io,
+                query,
+                [iv_b, iv_h, iv_q, d],
+                perm_map,
+                zero_io,
+                [True],
+                loc=loc,
+            ).result
+            kv_raw = vector.TransferReadOp(
+                v16_io,
+                k_cache,
+                [iv_b, h_kv, iv_k, d],
+                perm_map,
+                zero_io,
+                [True],
+                loc=loc,
+            ).result
+            # Upcast to f32 for FMA accumulation
+            if need_cast:
+                qv = arith.ExtFOp(v16_compute, qv_raw, loc=loc).result
+                kv_val = arith.ExtFOp(v16_compute, kv_raw, loc=loc).result
+            else:
+                qv = qv_raw
+                kv_val = kv_raw
 
-            loop_q = scf.ForOp(c0, q_dim2, c1, iter_args=[acc_hv])
-            with ir.InsertionPoint(loop_q.body):
-                q = loop_q.induction_variable
-                acc_qv = loop_q.inner_iter_args[0]
+            va1 = vector.FMAOp(qv, kv_val, va)
+            scf.YieldOp([va1.result])
 
-                loop_k = scf.ForOp(c0, k_dim2, c1, iter_args=[acc_qv])
-                with ir.InsertionPoint(loop_k.body):
-                    k = loop_k.induction_variable
-                    acc_kv = loop_k.inner_iter_args[0]
+        red = vector.ReductionOp(
+            compute_dtype, "add", vec_loop.result, loc=loc
+        ).result
+        # Sparse path folds the scale in here (no full-tensor tosa.mul).
+        if seq_bound is not None:
+            red = arith.MulFOp(red, scale_val, loc=loc).result
+        memref.StoreOp(red, score_mem, [iv_b, iv_h, iv_q, iv_k], loc=loc)
+        scf.ReduceOp([], 0)
 
-                    prev = tensor.ExtractOp(acc_kv, [b, h, q, k])
-
-                    vec_loop = scf.ForOp(
-                        c0, q_dim3, vec_len, iter_args=[zero_vec]
-                    )
-                    with ir.InsertionPoint(vec_loop.body):
-                        d = vec_loop.induction_variable
-                        va = vec_loop.inner_iter_args[0]
-                        perm_map = ir.AffineMap.get(
-                            4, 0, [ir.AffineDimExpr.get(3)]
-                        )
-                        # Read Q, K in tensor element type (f16 or f32)
-                        qv_raw = vector.TransferReadOp(
-                            v16_io,
-                            query,
-                            [b, h, q, d],
-                            perm_map,
-                            zero_io,
-                            [True],
-                            loc=loc,
-                        ).result
-                        kv_raw = vector.TransferReadOp(
-                            v16_io,
-                            k_cache,
-                            [b, h_kv, k, d],
-                            perm_map,
-                            zero_io,
-                            [True],
-                            loc=loc,
-                        ).result
-                        # Upcast to f32 for FMA accumulation
-                        if need_cast:
-                            qv = arith.ExtFOp(
-                                v16_compute, qv_raw, loc=loc
-                            ).result
-                            kv_val = arith.ExtFOp(
-                                v16_compute, kv_raw, loc=loc
-                            ).result
-                        else:
-                            qv = qv_raw
-                            kv_val = kv_raw
-
-                        va1 = vector.FMAOp(qv, kv_val, va)
-                        scf.YieldOp([va1.result])
-
-                    red = vector.ReductionOp(
-                        compute_dtype, "add", vec_loop.result, loc=loc
-                    ).result
-
-                    acc = arith.AddFOp(prev.result, red)
-                    next_tensor = tensor.InsertOp(
-                        acc.result, acc_kv, [b, h, q, k]
-                    )
-
-                    scf.YieldOp([next_tensor.result])
-
-                scf.YieldOp([loop_k.result])
-
-            scf.YieldOp([loop_q.result])
-
-        scf.YieldOp([loop_h.result])
-
-    score_tensor = score.result
+    score_tensor = bufferization.ToTensorOp(
+        ir.RankedTensorType.get(
+            [query_shape[0], query_shape[1], query_shape[2], key_shape[2]],
+            compute_dtype,
+        ),
+        score_mem,
+        restrict=True,
+        loc=loc,
+    ).result
     score_tensor_shape = ir.RankedTensorType.get(
         [query_shape[0], query_shape[1], query_shape[2], key_shape[2]],
         compute_dtype,
     )
 
-    # ========= scale + mask =========
-    scale_splat = tensor.SplatOp(
-        score_tensor_shape,
-        scale_val,
-        [],
-    ).result
+    # ========= scale + mask + softmax =========
+    if seq_bound is not None:
+        # Sparse parallel softmax over k < seq_bound. All in-range rows are
+        # unmasked (causal), and QK^T already applied the scale.
+        sm_shape = list(score_tensor_shape.shape)
+        red_shape = sm_shape[:3]
+        sm_mem = memref.AllocOp(
+            ir.MemRefType.get(sm_shape, compute_dtype), [], [], loc=loc
+        )
+        mx_mem = memref.AllocOp(
+            ir.MemRefType.get(red_shape, compute_dtype), [], [], loc=loc
+        )
+        sum_mem = memref.AllocOp(
+            ir.MemRefType.get(red_shape, compute_dtype), [], [], loc=loc
+        )
+        lse_mem = memref.AllocOp(
+            ir.MemRefType.get(red_shape, compute_dtype), [], [], loc=loc
+        )
 
-    shift = _create_mul_shift_operand()
-    scaled = tosa.MulOp(
-        score_tensor_shape, score_tensor, scale_splat, shift
-    ).result
-    add_op = _gen_arith_binary_op(scaled, attn_mask, tosa.AddOp)
+        # --- max per (b,h,q) ---
+        par_max = scf.ParallelOp(
+            results_=[],
+            lowerBound=[c0, c0, c0],
+            upperBound=[batch_dim, q_dim1, q_dim2],
+            step=[c1, c1, c1],
+            initVals=[],
+            loc=loc,
+        )
+        par_max_block = par_max.regions[0].blocks.append()
+        with ir.InsertionPoint(par_max_block):
+            mb = par_max_block.add_argument(index, loc)
+            mh = par_max_block.add_argument(index, loc)
+            mq = par_max_block.add_argument(index, loc)
+            mx_loop = scf.ForOp(c0, seq_bound, c1, iter_args=[neg_inf])
+            with ir.InsertionPoint(mx_loop.body):
+                mk = mx_loop.induction_variable
+                mv = mx_loop.inner_iter_args[0]
+                sval = memref.LoadOp(
+                    score_mem, [mb, mh, mq, mk], loc=loc
+                ).result
+                nv = arith.MaximumFOp(mv, sval, loc=loc).result
+                scf.YieldOp([nv])
+            memref.StoreOp(mx_loop.result, mx_mem, [mb, mh, mq], loc=loc)
+            scf.ReduceOp([], 0)
 
-    # ========= softmax (in f32 for stability) =========
-    softmax_output_shape = list(add_op.result.type.shape)
-    softmax_dim = len(softmax_output_shape) - 1
-    max_vals = tosa.ReduceMaxOp(add_op.result, softmax_dim)
-    sub_op = tosa.SubOp(add_op.result.type, add_op, max_vals)
-    exp_op = math.ExpOp(sub_op.result)
-    reduce_sum_op = tosa.ReduceSumOp(exp_op, softmax_dim)
-    log_op = tosa.LogOp(reduce_sum_op.result.type, reduce_sum_op)
-    log_sumexp = tosa.AddOp(max_vals.result.type, max_vals, log_op)
-    log_weights = tosa.SubOp(add_op.result.type, add_op, log_sumexp)
-    softmax_result = math.ExpOp(log_weights.result)
-    # log_sumexp_operand = _create_shape_operand(list(output_shape[1]))
-    log_sumexp_operand = _create_shape_operand(
-        [query_shape[0], query_shape[1], query_shape[2]]
-    )
-    log_sumexp = tosa.ReshapeOp(log_sumexp, log_sumexp_operand)
+        # --- exp(x - max) per element ---
+        par_exp = scf.ParallelOp(
+            results_=[],
+            lowerBound=[c0, c0, c0, c0],
+            upperBound=[batch_dim, q_dim1, q_dim2, seq_bound],
+            step=[c1, c1, c1, c1],
+            initVals=[],
+            loc=loc,
+        )
+        par_exp_block = par_exp.regions[0].blocks.append()
+        with ir.InsertionPoint(par_exp_block):
+            eb = par_exp_block.add_argument(index, loc)
+            eh = par_exp_block.add_argument(index, loc)
+            eq = par_exp_block.add_argument(index, loc)
+            ek = par_exp_block.add_argument(index, loc)
+            mval = memref.LoadOp(mx_mem, [eb, eh, eq], loc=loc).result
+            sval = memref.LoadOp(
+                score_mem, [eb, eh, eq, ek], loc=loc
+            ).result
+            dval = arith.SubFOp(sval, mval, loc=loc).result
+            eval_val = math.ExpOp(dval, loc=loc).result
+            memref.StoreOp(eval_val, sm_mem, [eb, eh, eq, ek], loc=loc)
+            scf.ReduceOp([], 0)
+
+        # --- sum per (b,h,q) ---
+        par_sum = scf.ParallelOp(
+            results_=[],
+            lowerBound=[c0, c0, c0],
+            upperBound=[batch_dim, q_dim1, q_dim2],
+            step=[c1, c1, c1],
+            initVals=[],
+            loc=loc,
+        )
+        par_sum_block = par_sum.regions[0].blocks.append()
+        with ir.InsertionPoint(par_sum_block):
+            sb = par_sum_block.add_argument(index, loc)
+            sh = par_sum_block.add_argument(index, loc)
+            sq = par_sum_block.add_argument(index, loc)
+            sm_loop = scf.ForOp(
+                c0, seq_bound, c1, iter_args=[zero_compute]
+            )
+            with ir.InsertionPoint(sm_loop.body):
+                sk = sm_loop.induction_variable
+                sv = sm_loop.inner_iter_args[0]
+                eval_val = memref.LoadOp(
+                    sm_mem, [sb, sh, sq, sk], loc=loc
+                ).result
+                nv = arith.AddFOp(sv, eval_val, loc=loc).result
+                scf.YieldOp([nv])
+            memref.StoreOp(sm_loop.result, sum_mem, [sb, sh, sq], loc=loc)
+            scf.ReduceOp([], 0)
+
+        # --- normalize ---
+        par_norm = scf.ParallelOp(
+            results_=[],
+            lowerBound=[c0, c0, c0, c0],
+            upperBound=[batch_dim, q_dim1, q_dim2, seq_bound],
+            step=[c1, c1, c1, c1],
+            initVals=[],
+            loc=loc,
+        )
+        par_norm_block = par_norm.regions[0].blocks.append()
+        with ir.InsertionPoint(par_norm_block):
+            nb = par_norm_block.add_argument(index, loc)
+            nh = par_norm_block.add_argument(index, loc)
+            nq = par_norm_block.add_argument(index, loc)
+            nk = par_norm_block.add_argument(index, loc)
+            sumval = memref.LoadOp(sum_mem, [nb, nh, nq], loc=loc).result
+            eval_val = memref.LoadOp(
+                sm_mem, [nb, nh, nq, nk], loc=loc
+            ).result
+            pval = arith.DivFOp(eval_val, sumval, loc=loc).result
+            memref.StoreOp(pval, sm_mem, [nb, nh, nq, nk], loc=loc)
+            scf.ReduceOp([], 0)
+
+        # --- logsumexp per (b,h,q) ---
+        par_lse = scf.ParallelOp(
+            results_=[],
+            lowerBound=[c0, c0, c0],
+            upperBound=[batch_dim, q_dim1, q_dim2],
+            step=[c1, c1, c1],
+            initVals=[],
+            loc=loc,
+        )
+        par_lse_block = par_lse.regions[0].blocks.append()
+        with ir.InsertionPoint(par_lse_block):
+            lb = par_lse_block.add_argument(index, loc)
+            lh = par_lse_block.add_argument(index, loc)
+            lq = par_lse_block.add_argument(index, loc)
+            mval = memref.LoadOp(mx_mem, [lb, lh, lq], loc=loc).result
+            sumval = memref.LoadOp(sum_mem, [lb, lh, lq], loc=loc).result
+            logval = math.LogOp(sumval, loc=loc).result
+            lse = arith.AddFOp(mval, logval, loc=loc).result
+            memref.StoreOp(lse, lse_mem, [lb, lh, lq], loc=loc)
+            scf.ReduceOp([], 0)
+
+        softmax_result = bufferization.ToTensorOp(
+            score_tensor_shape, sm_mem, restrict=True, loc=loc
+        ).result
+        log_sumexp = bufferization.ToTensorOp(
+            ir.RankedTensorType.get(red_shape, compute_dtype),
+            lse_mem,
+            restrict=True,
+            loc=loc,
+        ).result
+    else:
+        # Dense fallback: original tosa scale+mask+softmax chain.
+        scale_splat = tensor.SplatOp(
+            score_tensor_shape,
+            scale_val,
+            [],
+        ).result
+
+        shift = _create_mul_shift_operand()
+        scaled = tosa.MulOp(
+            score_tensor_shape, score_tensor, scale_splat, shift
+        ).result
+        add_op = _gen_arith_binary_op(scaled, attn_mask, tosa.AddOp)
+
+        softmax_output_shape = list(add_op.result.type.shape)
+        softmax_dim = len(softmax_output_shape) - 1
+        max_vals = tosa.ReduceMaxOp(add_op.result, softmax_dim)
+        sub_op = tosa.SubOp(add_op.result.type, add_op, max_vals)
+        exp_op = math.ExpOp(sub_op.result)
+        reduce_sum_op = tosa.ReduceSumOp(exp_op, softmax_dim)
+        log_op = tosa.LogOp(reduce_sum_op.result.type, reduce_sum_op)
+        log_sumexp = tosa.AddOp(max_vals.result.type, max_vals, log_op)
+        log_weights = tosa.SubOp(add_op.result.type, add_op, log_sumexp)
+        softmax_result = math.ExpOp(log_weights.result)
+        log_sumexp_operand = _create_shape_operand(
+            [query_shape[0], query_shape[1], query_shape[2]]
+        )
+        log_sumexp = tosa.ReshapeOp(log_sumexp, log_sumexp_operand)
 
     # Cast log_sumexp back to output dtype if needed
     if need_cast:
@@ -14034,99 +14181,84 @@ def gqa_attention_fused_op(node: GQAAttentionFusedOp, symbol_table):
         )
         log_sumexp = tosa.CastOp(log_sumexp_cast_type, log_sumexp).result
 
-    # ========= Prob * V =========
-    # Output accumulation tensor in compute_dtype (f32)
-    out_init_tensor_type = ir.RankedTensorType.get(
+    # ========= Prob * V (parallel over b,h,q,d-tiles) =========
+    out_mem_type = ir.MemRefType.get(
         [query_shape[0], query_shape[1], query_shape[2], query_shape[3]],
         compute_dtype,
     )
-    element = ir.FloatAttr.get(compute_dtype, 0.0)
-    attr = ir.DenseElementsAttr.get_splat(out_init_tensor_type, element)
-    out_init = arith.ConstantOp(out_init_tensor_type, attr).result
+    out_mem = memref.AllocOp(out_mem_type, [], [], loc=loc)
 
-    out = scf.ForOp(c0, batch_dim, c1, iter_args=[out_init], loc=loc)
-    with ir.InsertionPoint(out.body):
-        b = out.induction_variable
-        out_b = out.inner_iter_args[0]
+    par_sv = scf.ParallelOp(
+        results_=[],
+        lowerBound=[c0, c0, c0, c0],
+        upperBound=[batch_dim, q_dim1, q_dim2, q_dim3],
+        step=[c1, c1, c1, vec_len],
+        initVals=[],
+        loc=loc,
+    )
+    par_sv_block = par_sv.regions[0].blocks.append()
+    with ir.InsertionPoint(par_sv_block):
+        iv_b = par_sv_block.add_argument(index, loc)
+        iv_h = par_sv_block.add_argument(index, loc)
+        iv_q = par_sv_block.add_argument(index, loc)
+        iv_d = par_sv_block.add_argument(index, loc)
+        group_size_i = arith.ConstantOp(index, group_size, loc=loc).result
+        hk = arith.DivSIOp(iv_h, group_size_i, loc=loc).result
 
-        loop_h = scf.ForOp(c0, q_dim1, c1, iter_args=[out_b], loc=loc)
-        with ir.InsertionPoint(loop_h.body):
-            h = loop_h.induction_variable
-            out_hv = loop_h.inner_iter_args[0]
-            group_size_i = arith.ConstantOp(index, group_size, loc=loc).result
-            hk = arith.DivSIOp(h, group_size_i, loc=loc).result
+        vec_loop = scf.ForOp(c0, qk_bound, c1, iter_args=[zero_vec], loc=loc)
+        with ir.InsertionPoint(vec_loop.body):
+            k = vec_loop.induction_variable
+            va = vec_loop.inner_iter_args[0]
 
-            loop_q = scf.ForOp(c0, q_dim2, c1, iter_args=[out_hv], loc=loc)
-            with ir.InsertionPoint(loop_q.body):
-                q = loop_q.induction_variable
-                out_qv = loop_q.inner_iter_args[0]
+            # softmax_result is in compute_dtype (f32)
+            p = tensor.ExtractOp(
+                softmax_result, [iv_b, iv_h, iv_q, k], loc=loc
+            ).result
 
-                loop_d = scf.ForOp(
-                    c0, q_dim3, vec_len, iter_args=[out_qv], loc=loc
-                )
-                with ir.InsertionPoint(loop_d.body):
-                    d = loop_d.induction_variable
-                    out_dv = loop_d.inner_iter_args[0]
+            pv = vector.SplatOp(v16_compute, p, loc=loc).result
+            perm_map = ir.AffineMap.get(4, 0, [ir.AffineDimExpr.get(3)])
 
-                    vec_loop = scf.ForOp(
-                        c0, k_dim2, c1, iter_args=[zero_vec], loc=loc
-                    )
-                    with ir.InsertionPoint(vec_loop.body):
-                        k = vec_loop.induction_variable
-                        va = vec_loop.inner_iter_args[0]
+            # Read V in tensor element type (f16 or f32)
+            vv_raw = vector.TransferReadOp(
+                v16_io,
+                v_cache,
+                [iv_b, hk, k, iv_d],
+                perm_map,
+                zero_io,
+                [True],
+                loc=loc,
+            ).result
+            # Upcast to f32 for FMA
+            if need_cast:
+                vv = arith.ExtFOp(v16_compute, vv_raw, loc=loc).result
+            else:
+                vv = vv_raw
 
-                        # softmax_result is in compute_dtype (f32)
-                        p = tensor.ExtractOp(
-                            softmax_result, [b, h, q, k], loc=loc
-                        ).result
+            va1 = vector.FMAOp(pv, vv, va, loc=loc).result
 
-                        pv = vector.SplatOp(v16_compute, p, loc=loc).result
-                        perm_map = ir.AffineMap.get(
-                            4, 0, [ir.AffineDimExpr.get(3)]
-                        )
+            scf.YieldOp([va1])
 
-                        # Read V in tensor element type (f16 or f32)
-                        vv_raw = vector.TransferReadOp(
-                            v16_io,
-                            v_cache,
-                            [b, hk, k, d],
-                            perm_map,
-                            zero_io,
-                            [True],
-                            loc=loc,
-                        ).result
-                        # Upcast to f32 for FMA
-                        if need_cast:
-                            vv = arith.ExtFOp(
-                                v16_compute, vv_raw, loc=loc
-                            ).result
-                        else:
-                            vv = vv_raw
+        # Write f32 vector to f32 output memref
+        vector.TransferWriteOp(
+            None,
+            vec_loop.result,
+            out_mem,
+            [iv_b, iv_h, iv_q, iv_d],
+            perm_map,
+            [True],
+            loc=loc,
+        )
+        scf.ReduceOp([], 0)
 
-                        va1 = vector.FMAOp(pv, vv, va, loc=loc).result
-
-                        scf.YieldOp([va1])
-
-                    # Write f32 vector to f32 output tensor
-                    next_tensor = vector.TransferWriteOp(
-                        out_dv.type,
-                        vec_loop.result,
-                        out_dv,
-                        [b, h, q, d],
-                        perm_map,
-                        [True],
-                        loc=loc,
-                    )
-
-                    scf.YieldOp([next_tensor])
-
-                scf.YieldOp([loop_d.result])
-
-            scf.YieldOp([loop_q.result])
-
-        scf.YieldOp([loop_h.result])
-
-    out_tensor = out.result
+    out_tensor = bufferization.ToTensorOp(
+        ir.RankedTensorType.get(
+            [query_shape[0], query_shape[1], query_shape[2], query_shape[3]],
+            compute_dtype,
+        ),
+        out_mem,
+        restrict=True,
+        loc=loc,
+    ).result
 
     # Cast output from f32 back to mlir_dtype (f16) if needed
     if need_cast:

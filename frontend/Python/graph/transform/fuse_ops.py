@@ -467,6 +467,15 @@ def replace_gqa_attention_with_fused_op(
         ):
             v_parent_node.add_children(fused_op.name)
 
+    # Attach the KV cache position index node name so the importer can bound
+    # QK^T/softmax/score@V by the actual sequence length (sparse causal).
+    if len(k_index_put.args) > 1 and k_index_put.args[1] is not None:
+        pos_idx = k_index_put.args[1]
+        if isinstance(pos_idx, (list, tuple)):
+            pos_idx = next((x for x in pos_idx if x is not None), None)
+        if pos_idx is not None:
+            fused_op.kwargs["position"] = pos_idx
+
     k_view._children.clear()
     if graph.check_delete_node(k_view):
         graph.delete_node(k_view, [k_clone])

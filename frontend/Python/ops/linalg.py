@@ -3702,11 +3702,12 @@ def index_put_op(
 
     input1_elem_type = input1.type.element_type
     input1_memref_type = ir.MemRefType.get(input1_shape, input1_elem_type)
-    input1_src_memref = bufferization.ToBufferOp(
+    # In-place update: write directly into the input buffer. The input tensor
+    # is exclusively consumed by this IndexPut (the caller stores the result
+    # back into the same buffer), so the full-tensor copy is unnecessary.
+    input1_memref = bufferization.ToBufferOp(
         input1_memref_type, input1
     ).result
-    input1_memref = memref.AllocOp(input1_memref_type, [], []).result
-    memref.CopyOp(input1_src_memref, input1_memref)
 
     # Check if we can vectorize trailing dimensions
     num_vec_dims, vector_length = _get_vectorizable_trailing_dims(

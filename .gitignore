@@ -1,6 +1,6 @@
 # Nested build directory
 /build*
-
+/tmp
 # vscode configurations
 /.vscode
 
